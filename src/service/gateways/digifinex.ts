@@ -19,6 +19,8 @@ import Interfaces = require("../interfaces");
 import moment = require("moment");
 import _ = require("lodash");
 import log from "../logging";
+import { mime } from "serve-static";
+import { ninvoke } from "q";
 var shortId = require("shortid");
 var Deque = require("collections/deque");
 
@@ -127,7 +129,7 @@ class DigifinexMarketDataGateway implements Interfaces.IMarketDataGateway {
             .done();
     };
 
-    // TODO: Calculate best interval
+    // TODO: Calculate best interval in testing phase
     constructor(
         timeProvider: Utils.ITimeProvider,
         private _http: DigifinexHttp,
@@ -147,33 +149,28 @@ interface RejectableResponse {
     message: string;
 }
 
-// TODO: Not updated
+// Only limit orders are allowed in Digifinex
 interface DigifinexNewOrderRequest {
     symbol: string;
-    amount: string;
-    price: string; //Price to buy or sell at. Must be positive. Use random number for market orders.
-    exchange: string; //always "Digifinex"
-    side: string; // buy or sell
-    type: string; // "market" / "limit" / "stop" / "traling-stop" / "fill-or-kill" / "exchange market" / "exchange limit" / "exchange stop" / "exchange trailing-stop" / "exchange fill-or-kill". (type starting by "exchange " are exchange orders, others are margin trading orders)
-    is_hidden?: boolean;
+    amount: number;
+    price: number; //Price to buy or sell at.
+    type: string; // Side of the order: buy or sell 
+    timestamp: number;
 }
 
 interface DigifinexNewOrderResponse extends RejectableResponse {
+    code: number
     order_id: string;
 }
 
 interface DigifinexCancelOrderRequest {
     order_id: string;
+    timestamp: number;
 }
-
-interface DigifinexCancelReplaceOrderRequest extends DigifinexNewOrderRequest {
-    order_id: string;
-}
-
-interface DigifinexCancelReplaceOrderResponse extends DigifinexCancelOrderRequest, RejectableResponse { }
 
 interface DigifinexOrderStatusRequest {
     order_id: string;
+    timestamp: number;
 }
 
 interface DigifinexMyTradesRequest {
@@ -181,35 +178,47 @@ interface DigifinexMyTradesRequest {
     timestamp: number;
 }
 
+interface DigifinexIndividualOrderHistory {
+    order_id: string,
+    created_date: number,
+    finished_date: number,
+    symbol: string,
+    price: number,
+    amount: number,
+    executed_amount: number,
+    cash_amount: number,
+    avg_price: number,
+    type: string,
+    status: number
+}
+
+interface DigifinexIndividualOrderStatus {
+    order_id: string,
+    created_date: number,
+    finished_date: number,
+    price: number,
+    amount: number,
+    executed_amount: number,
+    cash_amount: number,
+    avg_price: number,
+    type: string,
+    status: number
+}
+
 interface DigifinexMyTradesResponse extends RejectableResponse {
-    price: string;
-    amount: string;
-    timestamp: number;
-    exchange: string;
-    type: string;
-    fee_currency: string;
-    fee_amount: string;
-    tid: number;
-    order_id: string;
+    code: number,
+    date: number,
+    total: number,
+    page: number,
+    num_per_page: number,
+    orders: DigifinexIndividualOrderHistory[]
 }
 
 interface DigifinexOrderStatusResponse extends RejectableResponse {
-    symbol: string;
-    exchange: string; // bitstamp or Digifinex
-    price: number;
-    avg_execution_price: string;
-    side: string;
-    type: string; // "market" / "limit" / "stop" / "trailing-stop".
-    timestamp: number;
-    is_live: boolean;
-    is_cancelled: boolean;
-    is_hidden: boolean;
-    was_forced: boolean;
-    executed_amount: string;
-    remaining_amount: string;
-    original_amount: string;
+    code: number,
+    data: DigifinexIndividualOrderStatus[]
 }
-
+// TODO: Open, cancel, check status and replace order
 class DigifinexOrderEntryGateway implements Interfaces.IOrderEntryGateway {
     OrderUpdate = new Utils.Evt<Models.OrderStatusUpdate>();
     ConnectChanged = new Utils.Evt<Models.ConnectivityStatus>();
@@ -532,7 +541,7 @@ class DigifinexPositionGateway implements Interfaces.IPositionGateway {
     PositionUpdate = new Utils.Evt<Models.CurrencyPosition>();
 
     private onRefreshPositions = () => {
-        const body = { timestamp: moment().utc().unix() }
+        const body: object = { timestamp: moment().utc().unix() }
         this._http.post<object, DigifinexPositionResponse>("myposition", body)
         .then(res => {
             const symbols = _.keys(res.data.free);
