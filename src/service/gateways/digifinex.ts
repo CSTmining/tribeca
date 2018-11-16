@@ -394,7 +394,6 @@ const generateSignature = <Object>(body, apiKey, apiSecret): Object => {
             .set('sign', signature);
 }
 
-// TODO: SIGNATURES in GET and POST
 class DigifinexHttp {
     ConnectChanged = new Utils.Evt<Models.ConnectivityStatus>();
 
@@ -518,26 +517,36 @@ class DigifinexHttp {
     }
 }
 
-interface DigifinexPositionResponseItem {
-    type: string;
-    currency: string;
-    amount: string;
-    available: string;
+type DigifinexCoinBalance = {
+    [key: string]: number
+}
+
+interface DigifinexPositionResponse {
+    code: number;
+    date: number;
+    free: DigifinexCoinBalance;
+    frozen: DigifinexCoinBalance;
 }
 
 class DigifinexPositionGateway implements Interfaces.IPositionGateway {
     PositionUpdate = new Utils.Evt<Models.CurrencyPosition>();
 
     private onRefreshPositions = () => {
-        this._http.post<{}, DigifinexPositionResponseItem[]>("balances", {}).then(res => {
-            _.forEach(_.filter(res.data, x => x.type === "exchange"), p => {
-                var amt = parseFloat(p.amount);
-                var cur = Models.toCurrency(p.currency);
-                var held = amt - parseFloat(p.available);
-                var rpt = new Models.CurrencyPosition(amt, held, cur);
+        const body = { timestamp: moment().utc().unix() }
+        this._http.post<object, DigifinexPositionResponse>("myposition", body)
+        .then(res => {
+            const symbols = _.keys(res.data.free);
+            _.forEach(symbols, symbol => {
+                const frozen = res.data.frozen[symbol];
+                const available = res.data.free[symbol];
+                const amt = parseFloat(frozen + available);
+                const cur = Models.toCurrency(symbol);
+                const held = frozen;
+                const rpt = new Models.CurrencyPosition(amt, held, cur);
                 this.PositionUpdate.trigger(rpt);
             });
-        }).done();
+        })
+        .done();
     }
 
     private _log = log("tribeca:gateway:DigifinexPG");
@@ -570,7 +579,7 @@ class DigifinexBaseGateway implements Interfaces.IExchangeDetailsGateway {
 
     constructor(public minTickIncrement: number) {} 
 }
-// OK
+
 class DigifinexSymbolProvider {
     public symbol: string;
 
