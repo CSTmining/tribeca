@@ -17,6 +17,7 @@ import Interfaces = require("../interfaces");
 import moment = require("moment");
 import log from "../logging";
 import _ = require("lodash");
+import { privateEncrypt } from "crypto";
 
 var shortId = require("shortid");
 var Deque = require("collections/deque");
@@ -115,7 +116,13 @@ class DigifinexMarketDataGateway implements Interfaces.IMarketDataGateway {
     MarketData = new Utils.Evt<Models.Market>();
     private onMarketData = (book: Models.Timestamped<DigifinexOrderBook>) => {
         const bids = DigifinexMarketDataGateway.ConvertToMarketSides(book.data.bids);
-        const asks = DigifinexMarketDataGateway.ConvertToMarketSides(book.data.asks);
+        const asks = DigifinexMarketDataGateway.ConvertToMarketSides(
+            _.orderBy(
+                book.data.asks,
+                ([price, ]: [number, number]) => price,
+                ['asc']
+            )
+        );
         this.MarketData.trigger(new Models.Market(bids, asks, book.time));
     };
 
@@ -136,7 +143,7 @@ class DigifinexMarketDataGateway implements Interfaces.IMarketDataGateway {
         private _http: DigifinexHttp,
         private _symbolProvider: DigifinexSymbolProvider) {
 
-        timeProvider.setInterval(this.downloadMarketData, moment.duration(5, "seconds"));
+        timeProvider.setInterval(this.downloadMarketData, moment.duration(1, "seconds"));
         timeProvider.setInterval(this.downloadMarketTrades, moment.duration(15, "seconds"));
 
         this.downloadMarketData();
@@ -163,6 +170,7 @@ interface DigifinexNewOrderResponse extends RejectableResponse {
     code: number
     order_id: string;
 }
+
 
 interface DigifinexCancelOrderRequest {
     order_id: string;
@@ -245,6 +253,7 @@ class DigifinexOrderEntryGateway implements Interfaces.IOrderEntryGateway {
     };
 
     sendOrder = (order: Models.OrderStatusReport) => {
+        console.log("sending order...")
         const req: DigifinexNewOrderRequest = this.convertToOrderRequest(order);
 
         this._http
@@ -318,28 +327,10 @@ class DigifinexOrderEntryGateway implements Interfaces.IOrderEntryGateway {
             symbol: this._symbolProvider.symbol
         };
         this._http
-            .post<DigifinexMyTradesRequest, DigifinexMyTradesResponse>("open_orders", tradesReq)
-            .then(resps => {
-                _.forEach(resps.data.orders, t => {
-                    this.OrderUpdate.trigger({
-                        exchangeId: t.order_id,
-                        lastPrice: t.price,
-                        lastQuantity: t.amount,
-                        orderStatus: DigifinexOrderEntryGateway.GetOrderStatus(t.status),
-                        averagePrice: t.avg_price,
-                        leavesQuantity: t.amount - t.executed_amount,
-                        cumQuantity: t.executed_amount,
-                        quantity: t.amount
-                    });
-
-                });
-            }).done();
-
-        this._http
             .post<DigifinexMyTradesRequest, DigifinexMyTradesResponse>("order_history", tradesReq)
             .then(resps => {
                 _.forEach(resps.data.orders, t => {
-                    this.OrderUpdate.trigger({
+                    const orderUpdate = {
                         exchangeId: t.order_id,
                         lastPrice: t.price,
                         lastQuantity: t.amount,
@@ -348,8 +339,8 @@ class DigifinexOrderEntryGateway implements Interfaces.IOrderEntryGateway {
                         leavesQuantity: t.amount - t.executed_amount,
                         cumQuantity: t.executed_amount,
                         quantity: t.amount
-                    });
-
+                    };
+                    this.OrderUpdate.trigger(orderUpdate);
                 });
             }).done();
 
@@ -357,6 +348,7 @@ class DigifinexOrderEntryGateway implements Interfaces.IOrderEntryGateway {
     };
 
     private static GetOrderStatus(code: number) {
+        console.log("CODE", code);
         switch(code) {
             case 0:
                 return Models.OrderStatus.Working;
@@ -428,7 +420,7 @@ const generateSignature = <Object>(body, apiKey, apiSecret): Object => {
     const signature = md5(sortedValues);
 
     return _.merge(body, {
-        apiKey: this._apiKey,
+        apiKey: apiKey,
         sign: signature
     });
 };
@@ -469,9 +461,11 @@ class DigifinexHttp {
         const opts: request.Options = {
             timeout: this._timeout,
             url: url,
-            body: this.appendSignature(msg),
-            json: true,
-            method: "POST"
+            formData: this.appendSignature(msg),
+            method: "POST",
+            headers: {
+              contentType: 'application/x-www-form-urlencoded'
+            }
         };
 
         return this.doRequest<TResponse>(opts, url);
@@ -498,7 +492,7 @@ class DigifinexHttp {
                 try {
                     const t = new Date();
                     const data = JSON.parse(body);
-                    data.message = data.code ? this.parseDigifinexCode(data.code) : this.parseDigifinexCode(-1);
+                    data.message = _.has(data, 'code') ? this.parseDigifinexCode(data.code) : "";
                     d.resolve(new Models.Timestamped(data, t));
                 }
                 catch (err) {
@@ -513,30 +507,54 @@ class DigifinexHttp {
 
     private parseDigifinexCode = (code: number) : string => {
         switch(code) {
-            case 0:	return 'Success';
-            case 10002: return 'Invalid ApiKey';
-            case 10003: return 'Sign doesn\'t match';
-            case 10004: return 'Illegal request parameters';
-            case 10005: return 'Request frequency exceeds the limit';
-            case 10006: return 'Unauthorized to execute this request';
-            case 10007: return 'IP address Unauthorized';
-            case 10008: return 'Timestamp for this request is invalid';
-            case 20001: return 'Trade is not open for this trading pair';
-            case 20002: return 'Trade of this trading pair is suspended';
-            case 20003: return 'Invalid price or amount';
-            case 20004: return 'Price exceeds daily limit';
-            case 20005: return 'Price exceeds down limit';
-            case 20006: return 'Cash Amount is less than 10CNY';
-            case 20007: return 'Price precision error';
-            case 20008: return 'Amount precision error';
-            case 20009: return 'Amount is less than the minimum requirement';
-            case 20010: return 'Cash Amount is less than the minimum requirement';
-            case 20011: return 'Insufficient balance';
-            case 20012: return 'Invalid trade type (valid value: buy/sell)';
-            case 20013: return 'No such order';
-            case 20014: return 'Invalid date (Valid format: 2018-07-25)';
-            case 20015: return 'Dates exceed the limit';
-            default: return 'Unknown digifinex code';
+            case 0:	
+                return 'Success';
+            case 10002:
+                return 'Invalid ApiKey';
+            case 10003:
+                return 'Sign doesn\'t match';
+            case 10004:
+                return 'Illegal request parameters';
+            case 10005:
+                return 'Request frequency exceeds the limit';
+            case 10006:
+                return 'Unauthorized to execute this request';
+            case 10007:
+                return 'IP address Unauthorized';
+            case 10008:
+                return 'Timestamp for this request is invalid';
+            case 20001:
+                return 'Trade is not open for this trading pair';
+            case 20002:
+                return 'Trade of this trading pair is suspended';
+            case 20003:
+                return 'Invalid price or amount';
+            case 20004:
+                return 'Price exceeds daily limit';
+            case 20005:
+                return 'Price exceeds down limit';
+            case 20006:
+                return 'Cash Amount is less than 10CNY';
+            case 20007:
+                return 'Price precision error';
+            case 20008:
+                return 'Amount precision error';
+            case 20009:
+                return 'Amount is less than the minimum requirement';
+            case 20010:
+                return 'Cash Amount is less than the minimum requirement';
+            case 20011:
+                return 'Insufficient balance';
+            case 20012:
+                return 'Invalid trade type (valid value: buy/sell)';
+            case 20013:
+                return 'No such order';
+            case 20014:
+                return 'Invalid date (Valid format: 2018-07-25)';
+            case 20015:
+                return 'Dates exceed the limit';
+            default:
+                return 'Unknown status message';
         }
     }
 
@@ -576,12 +594,15 @@ class DigifinexPositionGateway implements Interfaces.IPositionGateway {
         this._http.post<object, DigifinexPositionResponse>("myposition", body)
         .then(res => {
             const symbols = _.keys(res.data.free);
+            console.log(res)
             _.forEach(symbols, symbol => {
-                const frozen = res.data.frozen[symbol];
-                const available = res.data.free[symbol];
+                console.log(symbol)
+                const frozen = _.get(res.data.frozen, symbol, 0);
+                const available = _.get(res.data.free, symbol, 0);
                 const amt = frozen + available;
                 const cur = Models.toCurrency(symbol);
                 const held = frozen;
+                console.log(frozen, available, amt, held, cur)
                 const rpt = new Models.CurrencyPosition(amt, held, cur);
                 this.PositionUpdate.trigger(rpt);
             });
@@ -650,6 +671,7 @@ class Digifinex extends Interfaces.CombinedGateway {
 }
 
 export async function createDigifinex(timeProvider: Utils.ITimeProvider, config: Config.IConfigProvider, pair: Models.CurrencyPair) : Promise<Interfaces.CombinedGateway> {
+    const loggerInit = log("tribeca:digifinex:init");
     const apiSecret = config.GetString("DigifinexSecret");
     const apiKey = config.GetString("DigifinexKey");
     const qsParams = {
@@ -658,13 +680,14 @@ export async function createDigifinex(timeProvider: Utils.ITimeProvider, config:
     const qsBody = generateSignature(qsParams, apiKey, apiSecret);
 
     const detailsUrl = `${config.GetString("DigifinexHttpUrl")}/trade_pairs`;
-    const {data: response} = await requestPromise.get({url: detailsUrl, qs: qsBody, json: true});
+    const stringResponse = await requestPromise.get({url: detailsUrl, qs: qsBody, headers: { contentType: 'application/x-www-form-urlencoded'}});
+    const response = JSON.parse(stringResponse);
     const symbolList = _.keys(response.data);
 
     const symbol = new DigifinexSymbolProvider(pair);    
 
     if (_.includes(symbolList, symbol.symbol) == true) {
-        const [ , price_precision, , ] = response.data.data[symbol.symbol];
+        const [ , price_precision, , ] = response.data[symbol.symbol];
         return new Digifinex(timeProvider, config, symbol, 10**(-1*price_precision));
     }
 
