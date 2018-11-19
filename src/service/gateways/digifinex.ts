@@ -8,27 +8,29 @@
 import Q = require("q");
 import md5 = require("md5")
 import request = require("request");
-import url = require("url");
-import querystring = require("querystring");
+import requestPromise = require("request-promise");
 import Config = require("../config");
 import NullGateway = require("./nullgw");
 import Models = require("../../common/models");
 import Utils = require("../utils");
-import util = require("util");
 import Interfaces = require("../interfaces");
 import moment = require("moment");
+
 import _ = require("lodash");
-import log from "../logging";
-import { mime } from "serve-static";
-import { ninvoke } from "q";
+
 var shortId = require("shortid");
 var Deque = require("collections/deque");
 
 interface DigifinexMarketTrade {
     date: number;
-    price: string;
-    amount: string;
+    price: number;
+    amount: number;
     type: string;
+}
+
+interface DigifinexTradesResponse {
+    code: number,
+    data: DigifinexMarketTrade[]
 }
 
 interface DigifinexResponse<T> {
@@ -39,7 +41,7 @@ interface DigifinexResponse<T> {
 type DigifinexMarketLevel = [
     number, // price
     number // size amount
-]
+];
 
 interface DigifinexOrderBook {
     code: number,
@@ -80,36 +82,35 @@ class DigifinexMarketDataGateway implements Interfaces.IMarketDataGateway {
 
     private _since: number = null;
     MarketTrade = new Utils.Evt<Models.GatewayMarketTrade>();
-    private onTrades = ({data: trades}: Models.Timestamped<DigifinexResponse<DigifinexMarketTrade[]>>) => {
-        _.forEach(trades, trade => {
+    private onTrades = ({data: trades}: Models.Timestamped<DigifinexTradesResponse>) => {
+        _.forEach(trades.data, (trade: DigifinexMarketTrade) => {
             const px = trade.price;
-            var sz = trade.amount;
-            var time = moment.unix(trade.date).toDate();
-            var side = decodeSide(trade.type);
-            var mt = new Models.GatewayMarketTrade(px, sz, time, this._since === null, side);
+            const sz = trade.amount;
+            const time = moment.unix(trade.date).toDate();
+            const side = decodeSide(trade.type);
+            const mt = new Models.GatewayMarketTrade(px, sz, time, this._since === null, side);
             this.MarketTrade.trigger(mt);
         });
 
         this._since = moment().unix();
     };
     private downloadMarketTrades = () => {
-        var qs = {
+        const qs = {
             symbol: this._symbolProvider.symbol,
             timestamp: this._since === null ? moment.utc().unix() : this._since
         };
         this._http
             .get<DigifinexResponse<DigifinexMarketTrade[]>>("trade_detail", qs)
             .then(this.onTrades)
-            .done();
     };
 
     private static ConvertToMarketSide([price, size]: DigifinexMarketLevel): Models.MarketSide {
         return new Models.MarketSide(price, size);
-    }
+    };
 
     private static ConvertToMarketSides(level: DigifinexMarketLevel[]): Models.MarketSide[] {
         return _.map(level, DigifinexMarketDataGateway.ConvertToMarketSide);
-    }
+    };
 
     MarketData = new Utils.Evt<Models.Market>();
     private onMarketData = (book: Models.Timestamped<DigifinexOrderBook>) => {
@@ -123,7 +124,7 @@ class DigifinexMarketDataGateway implements Interfaces.IMarketDataGateway {
             symbol: this._symbolProvider.symbol,
             timestamp: moment.utc().unix()
         }
-        this._http
+        return this._http
             .get<DigifinexOrderBook>("depth", queryBody)
             .then(this.onMarketData)
             .done();
@@ -218,7 +219,8 @@ interface DigifinexOrderStatusResponse extends RejectableResponse {
     code: number,
     data: DigifinexIndividualOrderStatus[]
 }
-// TODO: Open, cancel, check status and replace order
+
+
 class DigifinexOrderEntryGateway implements Interfaces.IOrderEntryGateway {
     OrderUpdate = new Utils.Evt<Models.OrderStatusUpdate>();
     ConnectChanged = new Utils.Evt<Models.ConnectivityStatus>();
@@ -231,23 +233,24 @@ class DigifinexOrderEntryGateway implements Interfaces.IOrderEntryGateway {
     public cancelsByClientOrderId = false;
 
     private convertToOrderRequest = (order: Models.OrderStatusReport): DigifinexNewOrderRequest => {
-        return {
-            amount: order.quantity.toString(),
-            exchange: "Digifinex",
-            price: order.price.toString(),
-            side: encodeSide(order.side),
+        // Not allowed to select order type in digifinex API.
+        // const orderType = encodeTimeInForce(order.timeInForce, order.type)
+        return ({
+            amount: order.quantity,
+            price: order.price,
+            type: encodeSide(order.side),
             symbol: this._symbolProvider.symbol,
-            type: encodeTimeInForce(order.timeInForce, order.type)
-        };
-    }
+            timestamp: moment().unix()
+        });
+    };
 
     sendOrder = (order: Models.OrderStatusReport) => {
-        var req = this.convertToOrderRequest(order);
+        const req: DigifinexNewOrderRequest = this.convertToOrderRequest(order);
 
         this._http
-            .post<DigifinexNewOrderRequest, DigifinexNewOrderResponse>("order/new", req)
+            .post<DigifinexNewOrderRequest, any>("trade", req)
             .then(resp => {
-                if (typeof resp.data.message !== "undefined") {
+                if (resp.data.message !== 'Success') {
                     this.OrderUpdate.trigger({
                         orderStatus: Models.OrderStatus.Rejected,
                         orderId: order.orderId,
@@ -272,11 +275,14 @@ class DigifinexOrderEntryGateway implements Interfaces.IOrderEntryGateway {
     };
 
     cancelOrder = (cancel: Models.OrderStatusReport) => {
-        var req = { order_id: cancel.exchangeId };
+        const req: DigifinexCancelOrderRequest = {
+            order_id: cancel.exchangeId,
+            timestamp: moment().unix()
+        };
         this._http
-            .post<DigifinexCancelOrderRequest, any>("order/cancel", req)
+            .post<DigifinexCancelOrderRequest, any>("cancel_order", req)
             .then(resp => {
-                if (typeof resp.data.message !== "undefined") {
+                if (resp.data.message !== 'Success') {
                     this.OrderUpdate.trigger({
                         orderStatus: Models.OrderStatus.Rejected,
                         cancelRejected: true,
@@ -307,40 +313,63 @@ class DigifinexOrderEntryGateway implements Interfaces.IOrderEntryGateway {
     };
 
     private downloadOrderStatuses = () => {
-        var tradesReq = { timestamp: this._since.unix(), symbol: this._symbolProvider.symbol };
+        const tradesReq: DigifinexMyTradesRequest = {
+            timestamp: this._since.unix(),
+            symbol: this._symbolProvider.symbol
+        };
         this._http
-            .post<DigifinexMyTradesRequest, DigifinexMyTradesResponse[]>("mytrades", tradesReq)
+            .post<DigifinexMyTradesRequest, DigifinexMyTradesResponse>("open_orders", tradesReq)
             .then(resps => {
-                _.forEach(resps.data, t => {
+                _.forEach(resps.data.orders, t => {
+                    this.OrderUpdate.trigger({
+                        exchangeId: t.order_id,
+                        lastPrice: t.price,
+                        lastQuantity: t.amount,
+                        orderStatus: DigifinexOrderEntryGateway.GetOrderStatus(t.status),
+                        averagePrice: t.avg_price,
+                        leavesQuantity: t.amount - t.executed_amount,
+                        cumQuantity: t.executed_amount,
+                        quantity: t.amount
+                    });
 
-                    this._http
-                        .post<DigifinexOrderStatusRequest, DigifinexOrderStatusResponse>("order/status", { order_id: t.order_id })
-                        .then(r => {
+                });
+            }).done();
 
-                            this.OrderUpdate.trigger({
-                                exchangeId: t.order_id,
-                                lastPrice: parseFloat(t.price),
-                                lastQuantity: parseFloat(t.amount),
-                                orderStatus: DigifinexOrderEntryGateway.GetOrderStatus(r.data),
-                                averagePrice: parseFloat(r.data.avg_execution_price),
-                                leavesQuantity: parseFloat(r.data.remaining_amount),
-                                cumQuantity: parseFloat(r.data.executed_amount),
-                                quantity: parseFloat(r.data.original_amount)
-                            });
+        this._http
+            .post<DigifinexMyTradesRequest, DigifinexMyTradesResponse>("order_history", tradesReq)
+            .then(resps => {
+                _.forEach(resps.data.orders, t => {
+                    this.OrderUpdate.trigger({
+                        exchangeId: t.order_id,
+                        lastPrice: t.price,
+                        lastQuantity: t.amount,
+                        orderStatus: DigifinexOrderEntryGateway.GetOrderStatus(t.status),
+                        averagePrice: t.avg_price,
+                        leavesQuantity: t.amount - t.executed_amount,
+                        cumQuantity: t.executed_amount,
+                        quantity: t.amount
+                    });
 
-                        })
-                        .done();
                 });
             }).done();
 
         this._since = moment.utc();
     };
 
-    private static GetOrderStatus(r: DigifinexOrderStatusResponse) {
-        if (r.is_cancelled) return Models.OrderStatus.Cancelled;
-        if (r.is_live) return Models.OrderStatus.Working;
-        if (r.executed_amount === r.original_amount) return Models.OrderStatus.Complete;
-        return Models.OrderStatus.Other;
+    private static GetOrderStatus(code: number) {
+        switch(code) {
+            case 0:
+                return Models.OrderStatus.Working;
+            case 1:
+                return Models.OrderStatus.Working;
+            case 2:
+                return Models.OrderStatus.Complete;
+            case 3:
+            case 4:
+                return Models.OrderStatus.Cancelled
+            default:
+                return Models.OrderStatus.Other;
+        }
     }
 
     private _since = moment.utc();
@@ -385,30 +414,31 @@ class DigifinexRateLimitMonitor {
 
 const generateSignature = <Object>(body, apiKey, apiSecret): Object => {
     const sortedValues = _(body)
-            // Apend api key and api secret to body    
-            .set('apiKey', apiKey)
-            .set('apiSecret', apiSecret)
-            // Sort object by key params, alphabetically
-            .toPairs()
-            .sortBy(0)
-            .fromPairs()
-            // Retrieve the value of the fields in a joined string
-            .values()
-            .join('');
+        // Apend api key and api secret to body    
+        .set('apiKey', apiKey)
+        .set('apiSecret', apiSecret)
+        // Sort object by key params, alphabetically
+        .toPairs()
+        .sortBy(0)
+        .fromPairs()
+        // Retrieve the value of the fields in a joined string
+        .values()
+        .join('');
 
-        const signature = md5(sortedValues);
+    const signature = md5(sortedValues);
 
-        return _(body)
-            .set('apiKey', this._apiKey)
-            .set('sign', signature);
-}
+    return _.merge(body, {
+        apiKey: this._apiKey,
+        sign: signature
+    });
+};
 
 class DigifinexHttp {
     ConnectChanged = new Utils.Evt<Models.ConnectivityStatus>();
 
     private _timeout = 15000;
 
-    get = <T>(actionUrl: string, qs?: any): Q.Promise<Models.Timestamped<T>> => {
+    public get = <T>(actionUrl: string, qs?: any): Q.Promise<Models.Timestamped<T>> => {
         const url = this._baseUrl + "/" + actionUrl;
         var opts = {
             timeout: this._timeout,
@@ -422,7 +452,7 @@ class DigifinexHttp {
     
     // Digifinex seems to have a race condition where nonces are processed out of order when rapidly placing orders
     // Retry here - look to mitigate in the future by batching orders?
-    post = <TRequest, TResponse>(actionUrl: string, msg: TRequest): Q.Promise<Models.Timestamped<TResponse>> => {
+    public post = <TRequest, TResponse>(actionUrl: string, msg: TRequest): Q.Promise<Models.Timestamped<TResponse>> => {
         return this.postOnce<TRequest, TResponse>(actionUrl, _.clone(msg)).then(resp => {
             var rejectMsg: string = (<any>(resp.data)).message;
             if (typeof rejectMsg !== "undefined" && rejectMsg.indexOf("Nonce is too small") > -1)
@@ -430,8 +460,9 @@ class DigifinexHttp {
             else
                 return resp;
         });
-    }
-    private appendSignature = <Object>(body): Object => generateSignature(body, this._apiKey, this._secret)
+    };
+
+    private appendSignature = <Object>(body): Object => generateSignature(body, this._apiKey, this._secret);
 
     private postOnce = <TRequest, TResponse>(actionUrl: string, msg: TRequest): Q.Promise<Models.Timestamped<TResponse>> => {
         const url = this._baseUrl + "/" + actionUrl;
@@ -548,7 +579,7 @@ class DigifinexPositionGateway implements Interfaces.IPositionGateway {
             _.forEach(symbols, symbol => {
                 const frozen = res.data.frozen[symbol];
                 const available = res.data.free[symbol];
-                const amt = parseFloat(frozen + available);
+                const amt = frozen + available;
                 const cur = Models.toCurrency(symbol);
                 const held = frozen;
                 const rpt = new Models.CurrencyPosition(amt, held, cur);
@@ -564,7 +595,7 @@ class DigifinexPositionGateway implements Interfaces.IPositionGateway {
         this.onRefreshPositions();
     }
 }
-// OK
+
 class DigifinexBaseGateway implements Interfaces.IExchangeDetailsGateway {
     public get hasSelfTradePrevention() {
         return false;
@@ -618,17 +649,16 @@ class Digifinex extends Interfaces.CombinedGateway {
     }
 }
 
-// OK
 export async function createDigifinex(timeProvider: Utils.ITimeProvider, config: Config.IConfigProvider, pair: Models.CurrencyPair) : Promise<Interfaces.CombinedGateway> {
     const apiSecret = config.GetString("DigifinexSecret");
     const apiKey = config.GetString("DigifinexKey");
     const qsParams = {
         timestamp: moment.utc().unix()
-    }
-    const qsBody = generateSignature(qsParams, apiKey, apiSecret)
+    };
+    const qsBody = generateSignature(qsParams, apiKey, apiSecret);
 
     const detailsUrl = `${config.GetString("DigifinexHttpUrl")}/trade_pairs`;
-    const {data: response} = await request.get({url: detailsUrl, qs: qsBody, json: true});
+    const {data: response} = await requestPromise.get({url: detailsUrl, qs: qsBody, json: true});
     const symbolList = _.keys(response.data);
 
     const symbol = new DigifinexSymbolProvider(pair);    
